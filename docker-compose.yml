@@ -1,0 +1,103 @@
+services:
+  backend:
+    build: .
+
+    container_name: cloud-storage
+
+    depends_on:
+      postgre-db:
+        condition: service_healthy
+      minio-storage:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
+    ports:
+      - 11001:11001
+  postgre-db:
+    image: postgres:16-alpine
+
+    container_name: postgre-db
+
+    ports:
+      - 5432:5432
+
+    env_file:
+      - .env
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+  minio-storage:
+    image: minio/minio:latest
+    container_name: minio-storage
+
+    ports:
+      - 9000:9000
+      - 9001:9001
+
+    env_file:
+      - .env
+
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+
+    healthcheck:
+      test: ["CMD", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - minio_data:/data
+
+    command: server /data --console-address ":9001"
+
+    restart: always
+
+  redis:
+    image: redis:7.2-alpine
+
+    container_name: file_cache_redis
+
+    restart: always
+
+    ports:
+      - 6379:6379
+      - 6380:6380
+
+    command: >
+      redis-server
+       --appendonly yes
+       --maxmemory 256mb
+       --maxmemory-policy allkeys-lru
+
+    volumes:
+      - redis_data:/data
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+    deploy:
+      resources:
+        limits:
+          memory: 300M
+
+volumes:
+  redis_data:
+  minio_data:
+  postgres_data:
