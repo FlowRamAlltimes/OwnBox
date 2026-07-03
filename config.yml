@@ -1,0 +1,24 @@
+postgres:
+  name:
+  host: postgre-db
+  user:
+  password:
+redis:
+  password_addr: redis:6379
+  cache_addr: redis:6379
+  max_limit: 
+  time_to_cache:
+minio:
+  endpoint: minio-storage:9000
+  login: 
+  password: 
+  max_limit: 
+  bucket: file
+server:
+  address: :11001
+alert:
+  admin_mail: 
+  smtp_addr: smtp.gmail.com // or your one
+  smtp_port: 587
+  sender_mail: 
+  sender_password: 
