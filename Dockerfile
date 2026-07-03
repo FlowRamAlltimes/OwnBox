@@ -10,5 +10,6 @@ FROM alpine:latest
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=builder /build/cloud-service .
+COPY config.yml .
 EXPOSE 11001
 ENTRYPOINT [ "./cloud-service" ]
