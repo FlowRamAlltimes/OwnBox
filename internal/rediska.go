@@ -7,18 +7,18 @@ var (
 	fileRdb *redis.Client
 )
 
-func InitRedisForPasswords() *redis.Client {
+func InitRedisForPasswords(addr string) *redis.Client {
 	rdb = redis.NewClient(&redis.Options{
-		Addr:     "file_cache_redis:6379",
+		Addr:     addr,
 		DB:       0,
 		Password: "",
 	})
 	return rdb
 }
 
-func InitRedisForCache() *redis.Client {
+func InitRedisForCache(addr string) *redis.Client {
 	fileRdb = redis.NewClient(&redis.Options{
-		Addr:     "file_cache_redis:6379",
+		Addr:     addr,
 		DB:       1,
 		Password: "",
 	})
