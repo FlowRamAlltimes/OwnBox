@@ -10,6 +10,7 @@ OwnBox is a self-hosted ligth-weight cloud storage which provides fast transport
 * Database: PostgreSQL
 * Cache: Redis
 * Storage: MinIO
+* Encryption: bcrypt + MD5
 * Observability: email alerting `github.com/jordan-wright/email`
 
 ## Quick start
