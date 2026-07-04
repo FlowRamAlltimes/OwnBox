@@ -23,5 +23,8 @@ git clone https://github.com/FlowRamAlltimes/OwnBox
 ```bash
 docker compose up -d --build
 ```
+# Grafana Dashboards Example
+<img width="1756" height="986" alt="image" src="https://github.com/user-attachments/assets/3ce4e7c0-08bf-41b1-a508-71a44a4490f5" />
+
 
 ### Send me your suggestions about this project

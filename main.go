@@ -21,6 +21,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
@@ -94,6 +97,26 @@ var (
 	err               error
 	ConfigurationFile string = "config.yml"
 	Cfg               *ConfigurationYml
+	Cached_hits       = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cloud_storage_cached_hits",
+		Help: "total cached hits with Redis",
+	})
+	Active_files = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cloud_storage_active_files",
+		Help: "total files which contains server now",
+	})
+	TotalConnections = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cloud_storage_connections_now",
+		Help: "total connections now",
+	})
+	TotalErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cloud_srorage_total_errors",
+		Help: "total errors for this session",
+	})
+	TotalAccounts = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cloud_storage_total_accounts",
+		Help: "total accounts counter",
+	})
 )
 
 func main() {
@@ -148,6 +171,8 @@ func main() {
 		fileBucket: Cfg.MinIO.Bucket,
 	}
 
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+
 	pubilc := r.Group("/api/v1/auth")
 
 	{
@@ -196,6 +221,7 @@ func handleLogin(c *gin.Context) {
 
 	bytess, err := bcrypt.GenerateFromPassword([]byte(Login.Password), bcrypt.DefaultCost)
 	if err != nil {
+		TotalErrors.Inc()
 		slog.Debug("ERR: Creating hash out of password", "err", err, "ip", ip)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unexpected error, ask support"})
 		return
@@ -205,6 +231,7 @@ func handleLogin(c *gin.Context) {
 
 	status := rdb.Set(ctx, "user:"+Login.Username, password, 0).Err()
 	if status != nil {
+		TotalErrors.Inc()
 		if status == context.DeadlineExceeded {
 			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Redis timeout exceeded", "CRITICAL", status.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 				slog.Error("ERR: Alerter is dead", "err", err)
@@ -221,6 +248,7 @@ func handleLogin(c *gin.Context) {
 		return
 	} else {
 		c.String(http.StatusOK, "Account has been created and saved!", "login", Login.Username)
+		TotalAccounts.Inc()
 	}
 }
 
@@ -241,6 +269,7 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 
 	fh, err := c.FormFile("file")
 	if err != nil {
+		TotalErrors.Inc()
 		slog.Error("ERR: Formating file", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unexpected error, ask support"})
 		return
@@ -254,6 +283,7 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 
 	networkFile, err := fh.Open()
 	if err != nil {
+		TotalErrors.Inc()
 		slog.Error("ERR: Timeout exeeded", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unexpected error, ask support"})
 		return
@@ -264,6 +294,7 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 
 	preparedStream, typeOfFile, err := core.DetectFileType(networkFile)
 	if errors.As(err, &CoreErr) {
+		TotalErrors.Inc()
 		slog.Error("ERR: "+CoreErr.Op, "err", CoreErr.Err)
 		c.String(CoreErr.Code, CoreErr.Msg)
 		return
@@ -277,6 +308,7 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 
 	_, err = io.Copy(mw, preparedStream)
 	if err != nil {
+		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Creating new minIO client", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 			slog.Error("ERR: Alerter is dead", "err", err)
 		}
@@ -296,6 +328,7 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 		}
 		bytess, err := json.Marshal(Query)
 		if err != nil {
+			TotalErrors.Inc()
 			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Marshaling data from Json", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 				slog.Error("ERR: Alerter is dead", "err", err)
 			}
@@ -305,6 +338,7 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 		}
 
 		if err = fileRdb.Set(ctx, hash, bytess, time.Duration(Cfg.Redis.TimeToCache)*time.Second).Err(); err != nil {
+			TotalErrors.Inc()
 			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Setting data in Redis", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 				slog.Error("ERR: Alerter is dead", "err", err)
 			}
@@ -316,6 +350,7 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 
 	_, err = m.minClient.PutObject(ctx, m.fileBucket, hash, &buf, int64(len(buf.Bytes())), minio.PutObjectOptions{ContentType: typeOfFile})
 	if err != nil {
+		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Writing in minIO", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 			slog.Error("ERR: Alerter is dead", "err", err)
 		}
@@ -328,6 +363,7 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 
 	err = postgre.AddData(ctx, owner, hash, ts)
 	if errors.As(err, &E) {
+		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Adding data", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 			slog.Error("ERR: Alerter is dead", "err", err)
 		}
@@ -336,6 +372,7 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 		return
 	}
 
+	Active_files.Inc()
 	c.String(http.StatusOK, "Your file has saved successfilly! Hash: "+hash)
 }
 
@@ -354,6 +391,7 @@ func (m *CloudStorage) handleDownload(c *gin.Context) {
 
 	res, err := fileRdb.Get(ctx, hash).Bytes()
 	if err != nil {
+		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Taking data from Redis", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 			slog.Error("ERR: Alerter is dead", "err", err)
 		}
@@ -365,6 +403,7 @@ func (m *CloudStorage) handleDownload(c *gin.Context) {
 
 		err := json.Unmarshal(res, &SendDataToClient)
 		if err != nil {
+			TotalErrors.Inc()
 			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Unmarshaling data", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 				slog.Error("ERR: Alerter is dead", "err", err)
 			}
@@ -377,11 +416,13 @@ func (m *CloudStorage) handleDownload(c *gin.Context) {
 		size := reader.Size()
 
 		c.DataFromReader(http.StatusOK, size, "Content-Type application/octet-stream", reader, nil)
+		Cached_hits.Inc()
 		return
 	}
 
 	err = postgre.DownloadData(ctx, owner, hash)
 	if errors.As(err, &E) {
+		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Taking data from PostgreSQL", "CRITICAL", E.Err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 			slog.Error("ERR: Alerter is dead", "err", err)
 		}
@@ -392,6 +433,7 @@ func (m *CloudStorage) handleDownload(c *gin.Context) {
 
 	object, err := m.minClient.GetObject(ctx, m.fileBucket, hash, minio.GetObjectOptions{})
 	if err != nil {
+		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Taking file from minIO", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 			slog.Error("ERR: Alerter is dead", "err", err)
 		}
@@ -403,6 +445,7 @@ func (m *CloudStorage) handleDownload(c *gin.Context) {
 
 	info, err := object.Stat()
 	if err != nil {
+		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Taking stats from minIO", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 			slog.Error("ERR: Alerter is dead", "err", err)
 		}
@@ -428,6 +471,7 @@ func (m *CloudStorage) handleDelete(c *gin.Context) {
 	err := postgre.RemoveData(ctx, loggedOwner, hash)
 	if errors.As(err, &E) {
 		if E.Code == 500 {
+			TotalErrors.Inc()
 			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Removing data from PostgreSQL", "CRITICAL", E.Err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 				slog.Error("ERR: Alerter is down", "err", err)
 			}
@@ -440,6 +484,7 @@ func (m *CloudStorage) handleDelete(c *gin.Context) {
 
 	res := fileRdb.Unlink(ctx, hash).Err()
 	if res != nil {
+		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Removing data from Redis", "CRITICAL", res.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 			slog.Error("ERR: Alerter is down", "err", err)
 		}
@@ -450,6 +495,7 @@ func (m *CloudStorage) handleDelete(c *gin.Context) {
 
 	err = m.minClient.RemoveObject(ctx, m.fileBucket, hash, minio.RemoveObjectOptions{})
 	if err != nil {
+		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Removing data from MinIO", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 			slog.Error("ERR: Alerter is down", "err", err)
 		}
@@ -458,6 +504,7 @@ func (m *CloudStorage) handleDelete(c *gin.Context) {
 		return
 	}
 
+	Active_files.Dec()
 	c.String(http.StatusOK, "File has been deleted successfully")
 }
 
@@ -470,6 +517,7 @@ func handleDeleteAccount(c *gin.Context) {
 
 	err := rdb.Unlink(ctx, owner).Err()
 	if err != nil {
+		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Unlinking data from Redis", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 			slog.Error("ERR: Alerter is down", "err", err)
 		}
@@ -479,11 +527,13 @@ func handleDeleteAccount(c *gin.Context) {
 	}
 
 	c.String(http.StatusOK, "Your account has been deleted successfully!")
+	TotalAccounts.Dec()
 	slog.Debug("User has deleted his account", "login", owner)
 }
 
 func AuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		TotalConnections.Inc()
 		ctx, stop = context.WithTimeout(c.Request.Context(), 10*time.Second)
 		defer stop()
 
@@ -494,6 +544,7 @@ func AuthMiddleware() gin.HandlerFunc {
 
 		res, err := rdb.Get(ctx, preparedLogin).Result()
 		if err != nil {
+			TotalErrors.Inc()
 			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Taking data from Redis", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 				slog.Error("ERR: Alerter is down", "err", err)
 			}
@@ -503,6 +554,7 @@ func AuthMiddleware() gin.HandlerFunc {
 		}
 
 		if err = bcrypt.CompareHashAndPassword([]byte(res), []byte(passwordStr)); err != nil {
+			TotalErrors.Inc()
 			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Comparison of hash and password", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
 				slog.Error("ERR: Alerter is down", "err", err)
 			}
@@ -512,6 +564,7 @@ func AuthMiddleware() gin.HandlerFunc {
 		}
 
 		c.Next()
+		TotalConnections.Dec()
 	}
 }
 
@@ -519,6 +572,7 @@ func ParseYMLConfig(stream []byte) (*ConfigurationYml, error) {
 	var TmpStruct *ConfigurationYml
 
 	if err := yaml.Unmarshal(stream, &TmpStruct); err != nil {
+		TotalErrors.Inc()
 		return nil, err
 	}
 	return TmpStruct, nil
