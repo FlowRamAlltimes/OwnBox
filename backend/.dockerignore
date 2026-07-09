@@ -1,0 +1,8 @@
+*.log
+*.txt
+
+.git
+.gitignore
+
+*.exe
+*.test
