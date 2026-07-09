@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -28,6 +29,10 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
 )
+
+type ctxKey string
+
+const ReqID ctxKey = "request-id-key"
 
 type InternalRequest struct {
 	Username string `json:"login" binding:"required"`
@@ -97,6 +102,7 @@ var (
 	err               error
 	ConfigurationFile string = "config.yml"
 	Cfg               *ConfigurationYml
+	counter           uint64
 	Cached_hits       = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "cloud_storage_cached_hits",
 		Help: "total cached hits with Redis",
@@ -180,7 +186,7 @@ func main() {
 	}
 
 	private := r.Group("/api/v1")
-	private.Use(AuthMiddleware())
+	private.Use(AuthMiddleware(), AddRequestID())
 
 	authGroup := private.Group("/auth")
 
@@ -206,6 +212,13 @@ func main() {
 }
 
 func handleLogin(c *gin.Context) {
+
+	idIface := c.Request.Context().Value(ReqID)
+	id, ok := idIface.(string)
+	if !ok {
+		id = "unknown"
+	}
+
 	ip := c.RemoteIP()
 
 	ctx, stop = context.WithTimeout(c.Request.Context(), 20*time.Second)
@@ -214,7 +227,7 @@ func handleLogin(c *gin.Context) {
 	var Login InternalRequest
 
 	if err := c.ShouldBindJSON(&Login); err != nil {
-		slog.Debug("ERR: Parsing JSON", "err", err)
+		slog.Debug("ERR: Parsing JSON", "id", id, "err", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -222,7 +235,7 @@ func handleLogin(c *gin.Context) {
 	bytess, err := bcrypt.GenerateFromPassword([]byte(Login.Password), bcrypt.DefaultCost)
 	if err != nil {
 		TotalErrors.Inc()
-		slog.Debug("ERR: Creating hash out of password", "err", err, "ip", ip)
+		slog.Debug("ERR: Creating hash out of password", "id", id, "err", err, "ip", ip)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unexpected error, ask support"})
 		return
 	}
@@ -234,20 +247,20 @@ func handleLogin(c *gin.Context) {
 		TotalErrors.Inc()
 		if status == context.DeadlineExceeded {
 			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Redis timeout exceeded", "CRITICAL", status.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-				slog.Error("ERR: Alerter is dead", "err", err)
+				slog.Error("ERR: Alerter is dead", "id", id, "err", err)
 			}
-			slog.Error("ERR: Timeout exeeded", "err", status, "ip", ip)
+			slog.Error("ERR: Timeout exeeded", "id", id, "err", status, "ip", ip)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Unexpected error, ask support"})
 			return
 		}
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Creating new minIO client", "CRITICAL", status.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-			slog.Error("ERR: Alerter is dead", "err", err)
+			slog.Error("ERR: Alerter is dead", "id", id, "err", err)
 		}
-		slog.Error("ERR: Writing in Redis", "err", status, "ip", ip)
+		slog.Error("ERR: Writing in Redis", "id", id, "err", status, "ip", ip)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unexpected error, ask support"})
 		return
 	} else {
-		c.String(http.StatusOK, "Account has been created and saved!", "login", Login.Username)
+		c.String(http.StatusOK, "Account has been created and saved! Username: "+Login.Username)
 		TotalAccounts.Inc()
 	}
 }
@@ -260,6 +273,8 @@ func handleLogin(c *gin.Context) {
 func (m *CloudStorage) handleUpload(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, int64(Cfg.MinIO.Limit)<<20)
 
+	id := c.Request.Context().Value(ReqID).(string)
+
 	var E *postgre.CustomError
 
 	ctx, stop = context.WithTimeout(c.Request.Context(), 20*time.Second)
@@ -270,13 +285,13 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 	fh, err := c.FormFile("file")
 	if err != nil {
 		TotalErrors.Inc()
-		slog.Error("ERR: Formating file", "err", err)
+		slog.Error("ERR: Formating file", "id", id, "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unexpected error, ask support"})
 		return
 	}
 
 	if fh.Size > int64(Cfg.MinIO.Limit)<<20 {
-		slog.Debug("DEBUG: Client tried to save too lange file", "size", fh.Size)
+		slog.Debug("DEBUG: Client tried to save too lange file", "id", id, "size", fh.Size)
 		c.String(http.StatusRequestEntityTooLarge, "File must be under 1 GiB")
 		return
 	}
@@ -284,7 +299,7 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 	networkFile, err := fh.Open()
 	if err != nil {
 		TotalErrors.Inc()
-		slog.Error("ERR: Timeout exeeded", "err", err)
+		slog.Error("ERR: Timeout exeeded", "id", id, "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unexpected error, ask support"})
 		return
 	}
@@ -295,7 +310,7 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 	preparedStream, typeOfFile, err := core.DetectFileType(networkFile)
 	if errors.As(err, &CoreErr) {
 		TotalErrors.Inc()
-		slog.Error("ERR: "+CoreErr.Op, "err", CoreErr.Err)
+		slog.Error("ERR: "+CoreErr.Op, "id", id, "err", CoreErr.Err)
 		c.String(CoreErr.Code, CoreErr.Msg)
 		return
 	}
@@ -310,9 +325,9 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 	if err != nil {
 		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Creating new minIO client", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-			slog.Error("ERR: Alerter is dead", "err", err)
+			slog.Error("ERR: Alerter is down", "id", id, "err", err)
 		}
-		slog.Error("ERR: Copying in mw", "err", err)
+		slog.Error("ERR: Copying in mw", "id", id, "err", err)
 		c.String(http.StatusInternalServerError, "Unexpected error")
 		return
 	}
@@ -330,9 +345,9 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 		if err != nil {
 			TotalErrors.Inc()
 			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Marshaling data from Json", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-				slog.Error("ERR: Alerter is dead", "err", err)
+				slog.Error("ERR: Alerter is down", "id", id, "err", err)
 			}
-			slog.Error("ERR: Marshaling struct for Redis", "err", err)
+			slog.Error("ERR: Marshaling struct for Redis", "id", id, "err", err)
 			c.String(http.StatusInternalServerError, "Unexpected error")
 			return
 		}
@@ -340,9 +355,9 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 		if err = fileRdb.Set(ctx, hash, bytess, time.Duration(Cfg.Redis.TimeToCache)*time.Second).Err(); err != nil {
 			TotalErrors.Inc()
 			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Setting data in Redis", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-				slog.Error("ERR: Alerter is dead", "err", err)
+				slog.Error("ERR: Alerter is dead", "id", id, "err", err)
 			}
-			slog.Error("ERR: Writing in Redis", "err", err)
+			slog.Error("ERR: Writing in Redis", "id", id, "err", err)
 			c.String(http.StatusInternalServerError, "Unexpected error")
 			return
 		}
@@ -352,9 +367,9 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 	if err != nil {
 		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Writing in minIO", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-			slog.Error("ERR: Alerter is dead", "err", err)
+			slog.Error("ERR: Alerter is down", "id", id, "err", err)
 		}
-		slog.Error("ERR: Writing in MinIO", "err", err)
+		slog.Error("ERR: Writing in MinIO", "id", id, "err", err)
 		c.String(http.StatusInternalServerError, "Unexpected error")
 		return
 	}
@@ -365,9 +380,9 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 	if errors.As(err, &E) {
 		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Adding data", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-			slog.Error("ERR: Alerter is dead", "err", err)
+			slog.Error("ERR: Alerter is dead", "id", id, "err", err)
 		}
-		slog.Error("ERR: "+E.Op, "err", E.Err)
+		slog.Error("ERR: "+E.Op, "id", id, "err", E.Err)
 		c.String(E.Code, E.Msg)
 		return
 	}
@@ -384,6 +399,8 @@ func (m *CloudStorage) handleDownload(c *gin.Context) {
 	ctx, stop = context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer stop()
 
+	id := c.Request.Context().Value(ReqID).(string)
+
 	var E *postgre.CustomError
 
 	hash := c.Param("h")
@@ -393,10 +410,10 @@ func (m *CloudStorage) handleDownload(c *gin.Context) {
 	if err != nil {
 		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Taking data from Redis", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-			slog.Error("ERR: Alerter is dead", "err", err)
+			slog.Error("ERR: Alerter is dead", "id", id, "err", err)
 		}
 		if errors.Is(err, redis.Nil) {
-			slog.Debug("DEBUG: Key does not exist in cache, checking internal storage")
+			slog.Debug("DEBUG: Key does not exist in cache, checking internal storage", "id", id)
 		}
 	} else {
 		var SendDataToClient Cache
@@ -405,9 +422,9 @@ func (m *CloudStorage) handleDownload(c *gin.Context) {
 		if err != nil {
 			TotalErrors.Inc()
 			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Unmarshaling data", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-				slog.Error("ERR: Alerter is dead", "err", err)
+				slog.Error("ERR: Alerter is dead", "id", id, "err", err)
 			}
-			slog.Error("ERR: Parsing data from Redis", "err", err)
+			slog.Error("ERR: Parsing data from Redis", "id", id, "err", err)
 			c.String(http.StatusInternalServerError, "Unexpected error")
 			return
 		}
@@ -424,9 +441,9 @@ func (m *CloudStorage) handleDownload(c *gin.Context) {
 	if errors.As(err, &E) {
 		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Taking data from PostgreSQL", "CRITICAL", E.Err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-			slog.Error("ERR: Alerter is dead", "err", err)
+			slog.Error("ERR: Alerter is down", "id", id, "err", err)
 		}
-		slog.Error("ERR: "+E.Op, "err", E.Err)
+		slog.Error("ERR: "+E.Op, "id", id, "err", E.Err)
 		c.String(http.StatusForbidden, E.Msg)
 		return
 	}
@@ -435,9 +452,9 @@ func (m *CloudStorage) handleDownload(c *gin.Context) {
 	if err != nil {
 		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Taking file from minIO", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-			slog.Error("ERR: Alerter is dead", "err", err)
+			slog.Error("ERR: Alerter is down", "id", id, "err", err)
 		}
-		slog.Error("ERR: Taking file from minIO", "err", err)
+		slog.Error("ERR: Taking file from minIO", "id", id, "err", err)
 		c.String(http.StatusBadRequest, "Unexpected error")
 		return
 	}
@@ -447,9 +464,9 @@ func (m *CloudStorage) handleDownload(c *gin.Context) {
 	if err != nil {
 		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Taking stats from minIO", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-			slog.Error("ERR: Alerter is dead", "err", err)
+			slog.Error("ERR: Alerter is down", "id", id, "err", err)
 		}
-		slog.Error("ERR: Taking size from minIO", "err", err)
+		slog.Error("ERR: Taking size from minIO", "id", id, "err", err)
 		c.String(http.StatusBadRequest, "Unexpected error")
 		return
 	}
@@ -463,6 +480,8 @@ func (m *CloudStorage) handleDelete(c *gin.Context) {
 	ctx, stop = context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer stop()
 
+	id := c.Request.Context().Value(ReqID).(string)
+
 	var E *postgre.CustomError
 
 	hash := c.Param("h")
@@ -473,10 +492,10 @@ func (m *CloudStorage) handleDelete(c *gin.Context) {
 		if E.Code == 500 {
 			TotalErrors.Inc()
 			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Removing data from PostgreSQL", "CRITICAL", E.Err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-				slog.Error("ERR: Alerter is down", "err", err)
+				slog.Error("ERR: Alerter is down", "id", id, "err", err)
 			}
 		} else {
-			slog.Error("ERR: "+E.Op, "err", E.Err)
+			slog.Error("ERR: "+E.Op, "id", id, "err", E.Err)
 			c.String(E.Code, E.Msg)
 			return
 		}
@@ -486,9 +505,9 @@ func (m *CloudStorage) handleDelete(c *gin.Context) {
 	if res != nil {
 		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Removing data from Redis", "CRITICAL", res.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-			slog.Error("ERR: Alerter is down", "err", err)
+			slog.Error("ERR: Alerter is down", "id", id, "err", err)
 		}
-		slog.Error("ERR: Removing Data from Redis", "err", res)
+		slog.Error("ERR: Removing Data from Redis", "id", id, "err", res)
 		c.String(http.StatusInternalServerError, "We can't remove this element from storage, internal error")
 		return
 	}
@@ -497,9 +516,9 @@ func (m *CloudStorage) handleDelete(c *gin.Context) {
 	if err != nil {
 		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Removing data from MinIO", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-			slog.Error("ERR: Alerter is down", "err", err)
+			slog.Error("ERR: Alerter is down", "id", id, "err", err)
 		}
-		slog.Error("ERR: Removing Data from MinIO", "err", err)
+		slog.Error("ERR: Removing Data from MinIO", "id", id, "err", err)
 		c.String(http.StatusInternalServerError, "We can't remove this element from storage, internal error")
 		return
 	}
@@ -513,22 +532,24 @@ func handleDeleteAccount(c *gin.Context) {
 	ctx, stop = context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer stop()
 
+	id := c.Request.Context().Value(ReqID).(string)
+
 	owner := c.GetHeader("login")
 
 	err := rdb.Unlink(ctx, owner).Err()
 	if err != nil {
 		TotalErrors.Inc()
 		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Unlinking data from Redis", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-			slog.Error("ERR: Alerter is down", "err", err)
+			slog.Error("ERR: Alerter is down", "id", id, "err", err)
 		}
-		slog.Error("ERR: Removing account", "login", owner)
+		slog.Error("ERR: Removing account", "id", id, "login", owner)
 		c.String(http.StatusInternalServerError, "Unexpected error")
 		return
 	}
 
 	c.String(http.StatusOK, "Your account has been deleted successfully!")
 	TotalAccounts.Dec()
-	slog.Debug("User has deleted his account", "login", owner)
+	slog.Debug("User has deleted his account", "id", id, "login", owner)
 }
 
 func AuthMiddleware() gin.HandlerFunc {
@@ -536,6 +557,8 @@ func AuthMiddleware() gin.HandlerFunc {
 		TotalConnections.Inc()
 		ctx, stop = context.WithTimeout(c.Request.Context(), 10*time.Second)
 		defer stop()
+
+		ip := c.RemoteIP()
 
 		loginStr := c.GetHeader("login")
 		passwordStr := c.GetHeader("password")
@@ -546,9 +569,9 @@ func AuthMiddleware() gin.HandlerFunc {
 		if err != nil {
 			TotalErrors.Inc()
 			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Taking data from Redis", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-				slog.Error("ERR: Alerter is down", "err", err)
+				slog.Error("ERR: Alerter is down", "ip", ip, "err", err)
 			}
-			slog.Debug("DEBUG: Getting password from Redis", "err", err)
+			slog.Debug("DEBUG: Getting password from Redis", "ip", ip, "err", err)
 			c.String(http.StatusNotFound, "Incorrect login or inernal error")
 			return
 		}
@@ -556,15 +579,28 @@ func AuthMiddleware() gin.HandlerFunc {
 		if err = bcrypt.CompareHashAndPassword([]byte(res), []byte(passwordStr)); err != nil {
 			TotalErrors.Inc()
 			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Comparison of hash and password", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-				slog.Error("ERR: Alerter is down", "err", err)
+				slog.Error("ERR: Alerter is down", "ip", ip, "err", err)
 			}
-			slog.Debug("DEBUG: Incorrect password", "err", err)
+			slog.Debug("DEBUG: Incorrect password", "ip", ip, "err", err)
 			c.String(http.StatusForbidden, "Incorrect login or password")
 			return
 		}
 
 		c.Next()
 		TotalConnections.Dec()
+	}
+}
+
+func AddRequestID() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		reqID := atomic.AddUint64(&counter, 1)
+		reqIDstr := fmt.Sprintf("REQ-ID=%v", reqID)
+
+		newCtx := context.WithValue(c.Request.Context(), ReqID, reqIDstr)
+
+		c.Request = c.Request.WithContext(newCtx)
+
+		c.Next()
 	}
 }
 
