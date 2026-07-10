@@ -69,3 +69,5 @@ Use "ownbox [command] --help" for more information about a command.
 
 
 ### Send me your suggestions about this project
+ * any bugs
+ * any logic mistakes 
