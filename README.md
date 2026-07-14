@@ -6,7 +6,8 @@ OwnBox is a self-hosted ligth-weight cloud storage which provides fast transport
 
 
 ## Technology Stack
-* Backend Core: Go + Gin `github.com/gin-gonic/gin`
+* Backend Core: Go + Gin + gRPC `github.com/gin-gonic/gin`
+* Auth Core: Go + gRPC `google.golang.org/grpc`
 * CLI Core: Go + `net/http`
 * Database: PostgreSQL + pgx `github.com/jackc/pgx/v5`
 * Cache: Redis `github.com/redis/go-redis/v9`
