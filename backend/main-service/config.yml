@@ -1,0 +1,24 @@
+postgres:
+  name: cloud_storage_db
+  host: postgre-db
+  user: cloud_admin
+  password: cloud_admin_password
+redis:
+  cache_addr: redis:6379
+  max_limit: 50
+  time_to_cache: 180
+minio:
+  endpoint: minio-storage:9000
+  login: cloud_admin
+  password: cloud_admin
+  max_limit: 1024
+  bucket: file
+server:
+  address: :11001
+  grpc_address_with_port: auth-service:11002
+alert:
+  admin_mail: 
+  smtp_addr: smtp.gmail.com
+  smtp_port: 587
+  sender_mail: 
+  sender_password: 
