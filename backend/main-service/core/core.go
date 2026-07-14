@@ -9,6 +9,8 @@ import (
 	"net/smtp"
 
 	"github.com/jordan-wright/email"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 type CustomError struct {
@@ -91,4 +93,12 @@ func CriticalAlerter(adminEmail, subject, status, errorMsg, addr, port, sender, 
 	fmt.Printf("Alert system has done its work\n")
 
 	return nil
+}
+
+func GrpcClient(grpcAddr string) (*grpc.ClientConn, error) {
+	client, err := grpc.NewClient(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cloud-storage/authpb"
 	"cloud-storage/core"
 	postgre "cloud-storage/datab"
 	rediska "cloud-storage/internal"
@@ -16,7 +17,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -26,7 +29,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
-	"golang.org/x/crypto/bcrypt"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"gopkg.in/yaml.v3"
 )
 
@@ -65,10 +69,9 @@ type postgresCfg struct {
 }
 
 type redisCfg struct {
-	PasswordsAddr string `yaml:"password_addr"`
-	CacheAddr     string `yaml:"cache_addr"`
-	Limit         int    `yaml:"max_limit"`
-	TimeToCache   int    `yaml:"time_to_cache"`
+	CacheAddr   string `yaml:"cache_addr"`
+	Limit       int    `yaml:"max_limit"`
+	TimeToCache int    `yaml:"time_to_cache"`
 }
 
 type minioCfg struct {
@@ -80,7 +83,8 @@ type minioCfg struct {
 }
 
 type serverCfg struct {
-	Addr string `yaml:"address"`
+	Addr     string `yaml:"address"`
+	GrpcAddr string `yaml:"grpc_address_with_port"`
 }
 
 type mailCfg struct {
@@ -92,12 +96,10 @@ type mailCfg struct {
 }
 
 var (
-	rdb               *redis.Client
+	authClient        authpb.AuthServiceClient
 	fileRdb           *redis.Client
 	pdb               *pgxpool.Pool
 	gcCtx             context.Context
-	ctx               context.Context
-	stop              context.CancelFunc
 	gcStop            context.CancelFunc
 	err               error
 	ConfigurationFile string = "config.yml"
@@ -131,6 +133,10 @@ func main() {
 	gcCtx, gcStop = context.WithTimeout(context.Background(), 15*time.Second)
 	defer gcStop()
 
+	// Notify sends os.Signal in quit chanel
+	cx, cancCx := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer cancCx()
+
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	bytesRes, err := os.ReadFile(ConfigurationFile)
@@ -149,7 +155,13 @@ func main() {
 		return
 	}
 
-	rdb = rediska.InitRedisForPasswords(Cfg.Redis.PasswordsAddr)
+	grpcClient, err := core.GrpcClient(Cfg.Server.GrpcAddr)
+	if err != nil {
+		slog.Error("ERR: Making new grpc connection", "err", err)
+		return
+	}
+	authClient = authpb.NewAuthServiceClient(grpcClient)
+
 	fileRdb = rediska.InitRedisForCache(Cfg.Redis.CacheAddr)
 
 	var E *postgre.CustomError
@@ -203,12 +215,30 @@ func main() {
 	}
 
 	slog.Debug("[SERVER DEBUG]", "message", "We are going to start the server", "addr", Cfg.Server.Addr)
-	if err = r.Run(Cfg.Server.Addr); err != nil {
-		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Removing data from PostgreSQL", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-			slog.Error("ERR: Alerter is down", "err", err)
-		}
-		slog.Error("Server is down")
+
+	srv := &http.Server{
+		Addr:    Cfg.Server.Addr,
+		Handler: r,
 	}
+
+	go func(addr string) {
+		if err = srv.ListenAndServe(); err != nil {
+			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Removing data from PostgreSQL", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
+				slog.Error("ERR: Alerter is down", "err", err)
+			}
+			slog.Error("Server is down")
+		}
+	}(Cfg.Server.Addr)
+
+	// quit waits for signal and sends it in "sig"
+	<-cx.Done()
+
+	if err := srv.Shutdown(cx); err != nil {
+		slog.Error("ERR: We can't shut down the server", "addr", Cfg.Server.Addr)
+		return
+	}
+
+	slog.Debug("DEBUG: Server is shutted down!", "addr", srv.Addr)
 }
 
 func handleLogin(c *gin.Context) {
@@ -221,7 +251,7 @@ func handleLogin(c *gin.Context) {
 
 	ip := c.RemoteIP()
 
-	ctx, stop = context.WithTimeout(c.Request.Context(), 20*time.Second)
+	ctx, stop := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer stop()
 
 	var Login InternalRequest
@@ -232,37 +262,25 @@ func handleLogin(c *gin.Context) {
 		return
 	}
 
-	bytess, err := bcrypt.GenerateFromPassword([]byte(Login.Password), bcrypt.DefaultCost)
+	resp, err := authClient.UploadUser(ctx, &authpb.Input{Login: Login.Username, Password: Login.Password})
 	if err != nil {
-		TotalErrors.Inc()
-		slog.Debug("ERR: Creating hash out of password", "id", id, "err", err, "ip", ip)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unexpected error, ask support"})
-		return
-	}
-
-	password := string(bytess)
-
-	status := rdb.Set(ctx, "user:"+Login.Username, password, 0).Err()
-	if status != nil {
-		TotalErrors.Inc()
-		if status == context.DeadlineExceeded {
-			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Redis timeout exceeded", "CRITICAL", status.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-				slog.Error("ERR: Alerter is dead", "id", id, "err", err)
+		slog.Error("ERR: Uploading user", "username", Login.Username, "ip", ip, "err", err)
+		if !resp.GetResult() {
+			st, ok := status.FromError(err)
+			if ok {
+				switch st.Code() {
+				case codes.Internal:
+					c.String(http.StatusInternalServerError, "Unexpected error")
+				default:
+					c.String(http.StatusInternalServerError, "Unexpected error")
+				}
 			}
-			slog.Error("ERR: Timeout exeeded", "id", id, "err", status, "ip", ip)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Unexpected error, ask support"})
-			return
 		}
-		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Creating new minIO client", "CRITICAL", status.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-			slog.Error("ERR: Alerter is dead", "id", id, "err", err)
-		}
-		slog.Error("ERR: Writing in Redis", "id", id, "err", status, "ip", ip)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unexpected error, ask support"})
 		return
-	} else {
-		c.String(http.StatusOK, "Account has been created and saved! Username: "+Login.Username)
-		TotalAccounts.Inc()
 	}
+
+	c.String(http.StatusOK, "Account has been created and saved! Username: "+Login.Username)
+	TotalAccounts.Inc()
 }
 
 // Explanation: handler gets multipart form from
@@ -277,7 +295,7 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 
 	var E *postgre.CustomError
 
-	ctx, stop = context.WithTimeout(c.Request.Context(), 20*time.Second)
+	ctx, stop := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer stop()
 
 	owner := c.GetHeader("login")
@@ -396,7 +414,7 @@ func (m *CloudStorage) handleUpload(c *gin.Context) {
 // with that hash, program goes to minIO and takes data
 // from there
 func (m *CloudStorage) handleDownload(c *gin.Context) {
-	ctx, stop = context.WithTimeout(c.Request.Context(), 10*time.Second)
+	ctx, stop := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer stop()
 
 	id := c.Request.Context().Value(ReqID).(string)
@@ -477,7 +495,7 @@ func (m *CloudStorage) handleDownload(c *gin.Context) {
 // function gets hash of target and checks for abilitiy
 // to remove file from storage(if real owner mismatches with logged owner)
 func (m *CloudStorage) handleDelete(c *gin.Context) {
-	ctx, stop = context.WithTimeout(c.Request.Context(), 10*time.Second)
+	ctx, stop := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer stop()
 
 	id := c.Request.Context().Value(ReqID).(string)
@@ -529,21 +547,32 @@ func (m *CloudStorage) handleDelete(c *gin.Context) {
 
 // removes account
 func handleDeleteAccount(c *gin.Context) {
-	ctx, stop = context.WithTimeout(c.Request.Context(), 10*time.Second)
+	ctx, stop := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer stop()
 
 	id := c.Request.Context().Value(ReqID).(string)
 
 	owner := c.GetHeader("login")
+	password := c.GetHeader("password")
 
-	err := rdb.Unlink(ctx, owner).Err()
+	resp, err := authClient.DeleteUser(ctx, &authpb.Input{Login: owner, Password: password})
 	if err != nil {
-		TotalErrors.Inc()
-		if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Unlinking data from Redis", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-			slog.Error("ERR: Alerter is down", "id", id, "err", err)
+		slog.Error("ERR: Deleting user", "err", err)
+		if !resp.GetResult() {
+			st, ok := status.FromError(err)
+			if ok {
+				switch st.Code() {
+				case codes.Internal:
+					c.String(http.StatusInternalServerError, "Unexpected error")
+				case codes.NotFound:
+					c.String(http.StatusNotFound, "Not found")
+				case codes.PermissionDenied:
+					c.String(http.StatusForbidden, "Invalid login or password")
+				default:
+					c.String(http.StatusInternalServerError, "Unexpected error")
+				}
+			}
 		}
-		slog.Error("ERR: Removing account", "id", id, "login", owner)
-		c.String(http.StatusInternalServerError, "Unexpected error")
 		return
 	}
 
@@ -555,7 +584,7 @@ func handleDeleteAccount(c *gin.Context) {
 func AuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		TotalConnections.Inc()
-		ctx, stop = context.WithTimeout(c.Request.Context(), 10*time.Second)
+		ctx, stop := context.WithTimeout(c.Request.Context(), 10*time.Second)
 		defer stop()
 
 		ip := c.RemoteIP()
@@ -563,28 +592,20 @@ func AuthMiddleware() gin.HandlerFunc {
 		loginStr := c.GetHeader("login")
 		passwordStr := c.GetHeader("password")
 
-		preparedLogin := fmt.Sprintf("user:%s", loginStr)
-
-		res, err := rdb.Get(ctx, preparedLogin).Result()
+		output, err := authClient.VerifyUser(ctx, &authpb.Input{Login: loginStr, Password: passwordStr})
 		if err != nil {
-			TotalErrors.Inc()
-			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Taking data from Redis", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-				slog.Error("ERR: Alerter is down", "ip", ip, "err", err)
-			}
-			slog.Debug("DEBUG: Getting password from Redis", "ip", ip, "err", err)
-			c.String(http.StatusNotFound, "Incorrect login or inernal error")
+			slog.Error("ERR: Service error", "err", err)
+			c.String(http.StatusInternalServerError, "Unexpected error!")
 			return
 		}
 
-		if err = bcrypt.CompareHashAndPassword([]byte(res), []byte(passwordStr)); err != nil {
-			TotalErrors.Inc()
-			if err = core.CriticalAlerter(Cfg.Mail.AdminEmail, "Comparison of hash and password", "CRITICAL", err.Error(), Cfg.Mail.Addr, Cfg.Mail.Port, Cfg.Mail.Sender, Cfg.Mail.Password); err != nil {
-				slog.Error("ERR: Alerter is down", "ip", ip, "err", err)
-			}
-			slog.Debug("DEBUG: Incorrect password", "ip", ip, "err", err)
-			c.String(http.StatusForbidden, "Incorrect login or password")
+		if !output.GetVerification() {
+			slog.Debug("DEBUG: Bad attempt to verify account!", "login", loginStr, "ip", ip)
+			c.String(http.StatusForbidden, "Invalid login or password")
 			return
 		}
+
+		slog.Debug("DEBUG: New connection", "ip", ip)
 
 		c.Next()
 		TotalConnections.Dec()

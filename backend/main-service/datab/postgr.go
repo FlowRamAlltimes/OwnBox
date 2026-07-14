@@ -154,4 +154,3 @@ func RemoveData(ctx context.Context, owner, hash string) error {
 
 	return nil
 }
-
